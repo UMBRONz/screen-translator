@@ -1,0 +1,28 @@
+# Build output
+bin/
+obj/
+artifacts/
+publish/
+
+# IDE and user files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+
+# Runtime-generated files
+ScreenTranslator.settings.json
+ScreenTranslator.log
+
+# Secrets and signing material
+*.pfx
+*.p12
+*.snk
+.env
+.env.*
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

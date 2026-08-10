@@ -1,0 +1,14 @@
+{
+  "OcrLanguages": [
+    "en-US",
+    "ru-RU"
+  ],
+  "TranslationProvider": "google",
+  "LibreTranslateUrl": "https://libretranslate.com/translate",
+  "LibreTranslateApiKey": "",
+  "OverlayOpacity": 0.93,
+  "TypingDelayMs": 12,
+  "MaxOverlayWidth": 980,
+  "FontFamily": "Segoe UI Variable Text",
+  "FontSize": 18
+}
