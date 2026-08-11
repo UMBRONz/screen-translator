@@ -272,6 +272,8 @@ internal static class Translator
 
 internal sealed class OverlayForm : Form
 {
+    const int ContentTop = 22;
+    const int FooterHeight = 34;
     readonly List<TextBlock> blocks;
     readonly Settings settings;
     readonly System.Windows.Forms.Timer typing = new();
@@ -425,9 +427,10 @@ internal sealed class OverlayForm : Form
     }
     void ScrollBy(int amount)
     {
-        scrollOffset = Math.Clamp(scrollOffset + amount, 0, Math.Max(0, MeasureContentHeight() - (Height - 48)));
+        scrollOffset = Math.Clamp(scrollOffset + amount, 0, Math.Max(0, MeasureContentHeight() - ContentViewportHeight));
         Invalidate();
     }
+    int ContentViewportHeight => Math.Max(1, ClientSize.Height - ContentTop - FooterHeight);
     int MeasureContentHeight()
     {
         int total = 0;
@@ -451,14 +454,17 @@ internal sealed class OverlayForm : Form
             return;
         }
         renderedBlockBounds.Clear();
-        int y = 22 - scrollOffset;
+        int contentBottom = ClientSize.Height - FooterHeight;
+        var contentState = e.Graphics.Save();
+        e.Graphics.SetClip(new Rectangle(20, ContentTop, Math.Max(1, ClientSize.Width - 40), ContentViewportHeight));
+        int y = ContentTop - scrollOffset;
         for (int index = 0; index < visible.Count; index++)
         {
             var b = visible[index];
             bool heading = b.Kind == BlockKind.Heading;
             using var font = new Font(settings.FontFamily, heading ? settings.FontSize + 4 : settings.FontSize, heading || b.Bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel);
             string text = b.Kind == BlockKind.Bullet && !Regex.IsMatch(b.Text, @"^([•●▪◦*-]|\d+[.)])") ? "• " + b.Text : b.Text;
-            var rect = new Rectangle(26, y, Width - 52, Height - y - 18);
+            var rect = new Rectangle(26, y, Width - 52, Math.Max(1, contentBottom - y));
             var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
             var size = TextRenderer.MeasureText(e.Graphics, text, font, new Size(rect.Width, 1000), flags);
             var blockRect = new Rectangle(rect.X, rect.Y, rect.Width, size.Height);
@@ -469,12 +475,13 @@ internal sealed class OverlayForm : Form
                 e.Graphics.FillRectangle(selection, blockRect);
             }
             TextRenderer.DrawText(e.Graphics, text, font, blockRect, Color.FromArgb(245, 248, 252), flags);
-            y += size.Height + (heading ? 10 : 7); if (y > Height - 25) break;
+            y += size.Height + (heading ? 10 : 7); if (y >= contentBottom) break;
         }
-        int contentHeight = MeasureContentHeight(), viewport = Height - 48;
+        e.Graphics.Restore(contentState);
+        int contentHeight = MeasureContentHeight(), viewport = ContentViewportHeight;
         if (contentHeight > viewport)
         {
-            int trackHeight = Height - 58;
+            int trackHeight = Math.Max(1, contentBottom - 24);
             int thumbHeight = Math.Max(28, trackHeight * viewport / contentHeight);
             int maxScroll = Math.Max(1, contentHeight - viewport);
             int thumbY = 24 + (trackHeight - thumbHeight) * scrollOffset / maxScroll;
