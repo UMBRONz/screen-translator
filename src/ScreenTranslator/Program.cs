@@ -89,11 +89,11 @@ internal sealed class TrayContext : ApplicationContext
 }
 
 internal enum BlockKind { Heading, Text, Bullet }
-internal record TextBlock(string Text, BlockKind Kind);
+internal record TextBlock(string Text, BlockKind Kind, bool Bold);
 
 internal static class OcrService
 {
-    sealed record RawLine(string Text, double Height, double Left, double Top);
+    sealed record RawLine(string Text, double Height, double Left, double Top, double InkDensity);
     sealed record Candidate(string Language, List<RawLine> Lines, double Score);
 
     public static async Task<List<TextBlock>> RecognizeAsync(Bitmap bitmap, Settings settings)
@@ -115,7 +115,7 @@ internal static class OcrService
                 if (engine is null) continue;
                 var result = await engine.RecognizeAsync(softwareBitmap);
                 var engineLines = result.Lines
-                    .Select(l => ToRawLine(l))
+                    .Select(l => ToRawLine(l, bitmap))
                     .Where(x => x.Text.Length > 0).ToList();
                 if (engineLines.Count > 0) candidates.Add(new Candidate(tag, engineLines, Quality(engineLines, tag)));
             }
@@ -126,7 +126,7 @@ internal static class OcrService
             var fallback = OcrEngine.TryCreateFromUserProfileLanguages();
             if (fallback is null) throw new InvalidOperationException("Компонент Windows OCR недоступен. Установите языковые пакеты English OCR и Russian OCR в Параметрах Windows.");
             var result = await fallback.RecognizeAsync(softwareBitmap);
-            var fallbackLines = result.Lines.Select(ToRawLine).Where(x => x.Text.Length > 0).ToList();
+            var fallbackLines = result.Lines.Select(l => ToRawLine(l, bitmap)).Where(x => x.Text.Length > 0).ToList();
             candidates.Add(new Candidate("profile", fallbackLines, Quality(fallbackLines, "profile")));
         }
         var primary = candidates.OrderByDescending(x => x.Score).First();
@@ -138,18 +138,57 @@ internal static class OcrService
         }).ToList();
         if (lines.Count == 0) return [];
         double median = lines.Select(x => x.Height).Order().ElementAt(lines.Count / 2);
+        var bodyDensities = lines.Where(x => x.Height >= median * .78 && x.Height <= median * 1.18 && x.InkDensity > 0).Select(x => x.InkDensity).Order().ToList();
+        double medianDensity = bodyDensities.Count == 0 ? .16 : bodyDensities[bodyDensities.Count / 2];
         double leftEdge = lines.Select(x => x.Left).Order().ElementAt(Math.Max(0, lines.Count / 5));
         var indented = lines.Select(x => x.Left > leftEdge + Math.Max(16, median * .8)).ToArray();
-        return lines.Select((x, i) => new TextBlock(Clean(x.Text), Kind(x.Text, x.Height, median, i,
-            indented[i] && ((i > 0 && indented[i - 1]) || (i + 1 < indented.Length && indented[i + 1]))))).ToList();
+        return lines.Select((x, i) =>
+        {
+            var kind = Kind(x.Text, x.Height, median, i, indented[i] && ((i > 0 && indented[i - 1]) || (i + 1 < indented.Length && indented[i + 1])));
+            bool bold = kind == BlockKind.Heading || Regex.IsMatch(x.Text, @"^\s*Q\s*[:.]", RegexOptions.IgnoreCase)
+                || (x.Height <= median * 1.2 && x.InkDensity > Math.Max(.13, medianDensity * 1.24));
+            return new TextBlock(Clean(x.Text), kind, bold);
+        }).ToList();
     }
 
-    static RawLine ToRawLine(OcrLine line)
+    static RawLine ToRawLine(OcrLine line, Bitmap bitmap)
     {
-        if (line.Words.Count == 0) return new RawLine(line.Text.Trim(), 0, 0, 0);
+        if (line.Words.Count == 0) return new RawLine(line.Text.Trim(), 0, 0, 0, 0);
         double left = line.Words.Min(w => w.BoundingRect.Left);
         double top = line.Words.Min(w => w.BoundingRect.Top);
-        return new RawLine(line.Text.Trim(), line.Words.Average(w => w.BoundingRect.Height), left, top);
+        return new RawLine(line.Text.Trim(), line.Words.Average(w => w.BoundingRect.Height), left, top, EstimateInkDensity(line, bitmap));
+    }
+
+    static double EstimateInkDensity(OcrLine line, Bitmap bitmap)
+    {
+        if (line.Words.Count == 0) return 0;
+        int left = Math.Max(0, (int)Math.Floor(line.Words.Min(w => w.BoundingRect.Left)));
+        int top = Math.Max(0, (int)Math.Floor(line.Words.Min(w => w.BoundingRect.Top)));
+        int right = Math.Min(bitmap.Width - 1, (int)Math.Ceiling(line.Words.Max(w => w.BoundingRect.Right)));
+        int bottom = Math.Min(bitmap.Height - 1, (int)Math.Ceiling(line.Words.Max(w => w.BoundingRect.Bottom)));
+        var backgrounds = new List<double>();
+        int edgeStep = Math.Max(1, (right - left) / 20);
+        for (int x = left; x <= right; x += edgeStep)
+        {
+            backgrounds.Add(bitmap.GetPixel(x, Math.Max(0, top - 2)).GetBrightness());
+            backgrounds.Add(bitmap.GetPixel(x, Math.Min(bitmap.Height - 1, bottom + 2)).GetBrightness());
+        }
+        double background = backgrounds.Count == 0 ? .5 : backgrounds.Order().ElementAt(backgrounds.Count / 2);
+        int ink = 0, sampled = 0;
+        foreach (var word in line.Words)
+        {
+            var bounds = word.BoundingRect;
+            var r = Rectangle.FromLTRB((int)Math.Floor(bounds.Left), (int)Math.Floor(bounds.Top), (int)Math.Ceiling(bounds.Right), (int)Math.Ceiling(bounds.Bottom));
+            r.Intersect(new Rectangle(0, 0, bitmap.Width, bitmap.Height));
+            int step = r.Width * r.Height > 2500 ? 2 : 1;
+            for (int y = r.Top; y < r.Bottom; y += step)
+                for (int x = r.Left; x < r.Right; x += step)
+                {
+                    sampled++;
+                    if (Math.Abs(bitmap.GetPixel(x, y).GetBrightness() - background) > .16) ink++;
+                }
+        }
+        return sampled == 0 ? 0 : ink / (double)sampled;
     }
 
     static double Quality(List<RawLine> lines, string language)
@@ -182,7 +221,7 @@ internal static class OcrService
     static BlockKind Kind(string text, double h, double median, int index, bool looksIndentedList)
     {
         if (looksIndentedList || Regex.IsMatch(text, @"^([•●▪◦*-]|\d+[.)])\s*")) return BlockKind.Bullet;
-        if ((h > median * 1.22 || index == 0 && text.Length < 80) && !Regex.IsMatch(text, @"[.!?]$")) return BlockKind.Heading;
+        if ((h > median * 1.36 || index == 0 && text.Length < 80) && !Regex.IsMatch(text, @"[.!?]$")) return BlockKind.Heading;
         return BlockKind.Text;
     }
 }
@@ -243,6 +282,10 @@ internal sealed class OverlayForm : Form
     int loadingAngle;
     bool loading = true;
     readonly List<TextBlock> visible = [];
+    readonly Dictionary<int, Rectangle> renderedBlockBounds = [];
+    readonly HashSet<int> selectedBlocks = [];
+    bool selecting;
+    int selectionAnchor = -1;
 
     public OverlayForm(List<TextBlock> blocks, Size sourceSize, Settings settings)
     {
@@ -254,11 +297,15 @@ internal sealed class OverlayForm : Form
         Width = Math.Clamp(sourceSize.Width, 360, maxW);
         Height = Math.Clamp(sourceSize.Height, 170, Screen.FromPoint(Cursor.Position).WorkingArea.Height - 24);
         MinimumSize = new Size(320, 150);
+        ResizeRedraw = true;
         PositionNearCursor();
-        KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) Close(); };
-        MouseDown += (_, e) => { if (e.Button == MouseButtons.Left) Native.ReleaseCaptureAndMove(Handle); };
+        KeyDown += (_, e) => HandleKeyDown(e);
+        MouseDown += HandleMouseDown;
+        MouseMove += HandleMouseMove;
+        MouseUp += HandleMouseUp;
         MouseWheel += (_, e) => ScrollBy(-(e.Delta / 120) * 64);
         DoubleClick += (_, _) => Close();
+        ContextMenuStrip = BuildContextMenu();
         typing.Interval = Math.Clamp(settings.TypingDelayMs / 3, 1, 100);
         typing.Tick += (_, _) => NextCharacter();
         loadingAnimation.Tick += (_, _) => { loadingAngle = (loadingAngle + 7) % 360; Invalidate(); };
@@ -275,7 +322,7 @@ internal sealed class OverlayForm : Form
     }
 
     protected override bool ShowWithoutActivation => true;
-    protected override CreateParams CreateParams { get { var cp = base.CreateParams; cp.ExStyle |= 0x08000000 | 0x00000080; return cp; } }
+    protected override CreateParams CreateParams { get { var cp = base.CreateParams; cp.ExStyle |= 0x00000080; return cp; } }
     protected override void WndProc(ref Message m)
     {
         const int WM_NCHITTEST = 0x0084, HTCLIENT = 1;
@@ -304,6 +351,65 @@ internal sealed class OverlayForm : Form
         int x = Cursor.Position.X - Width / 2, y = Cursor.Position.Y - 20;
         Location = new Point(Math.Clamp(x, area.Left + 12, area.Right - Width - 12), Math.Clamp(y, area.Top + 12, area.Bottom - Height - 12));
     }
+    ContextMenuStrip BuildContextMenu()
+    {
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("Копировать выделенное", null, (_, _) => CopySelected());
+        menu.Items.Add("Выделить всё", null, (_, _) => SelectAllText());
+        menu.Items.Add("Копировать весь текст", null, (_, _) => CopyAll());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Закрыть", null, (_, _) => Close());
+        return menu;
+    }
+    void HandleKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Escape) { Close(); return; }
+        if (e.Control && e.KeyCode == Keys.A) { SelectAllText(); e.SuppressKeyPress = true; }
+        else if (e.Control && e.KeyCode == Keys.C) { CopySelected(); e.SuppressKeyPress = true; }
+    }
+    void HandleMouseDown(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        Focus();
+        int hit = HitBlock(e.Location);
+        if (hit < 0) { Native.ReleaseCaptureAndMove(Handle); return; }
+        selecting = true; selectionAnchor = hit; Capture = true;
+        if ((ModifierKeys & Keys.Control) == 0) selectedBlocks.Clear();
+        selectedBlocks.Add(hit); Invalidate();
+    }
+    void HandleMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (!selecting || selectionAnchor < 0) return;
+        int hit = HitBlock(e.Location); if (hit < 0) return;
+        selectedBlocks.Clear();
+        for (int i = Math.Min(selectionAnchor, hit); i <= Math.Max(selectionAnchor, hit); i++) selectedBlocks.Add(i);
+        Invalidate();
+    }
+    void HandleMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || !selecting) return;
+        selecting = false; Capture = false;
+    }
+    int HitBlock(Point point)
+    {
+        foreach (var pair in renderedBlockBounds) if (pair.Value.Contains(point)) return pair.Key;
+        return -1;
+    }
+    void SelectAllText()
+    {
+        selectedBlocks.Clear();
+        for (int i = 0; i < blocks.Count; i++) selectedBlocks.Add(i);
+        Invalidate();
+    }
+    void CopySelected()
+    {
+        if (selectedBlocks.Count == 0) return;
+        Clipboard.SetText(string.Join(Environment.NewLine, selectedBlocks.Order().Select(i => blocks[i].Text)));
+    }
+    void CopyAll()
+    {
+        if (blocks.Count > 0) Clipboard.SetText(string.Join(Environment.NewLine, blocks.Select(x => x.Text)));
+    }
     void NextCharacter()
     {
         for (int step = 0; step < typingChunk; step++)
@@ -329,7 +435,7 @@ internal sealed class OverlayForm : Form
         foreach (var b in visible)
         {
             bool heading = b.Kind == BlockKind.Heading;
-            using var font = new Font(settings.FontFamily, heading ? settings.FontSize + 4 : settings.FontSize, heading ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel);
+            using var font = new Font(settings.FontFamily, heading ? settings.FontSize + 4 : settings.FontSize, heading || b.Bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel);
             string text = b.Kind == BlockKind.Bullet && !Regex.IsMatch(b.Text, @"^([•●▪◦*-]|\d+[.)])") ? "• " + b.Text : b.Text;
             total += TextRenderer.MeasureText(g, text, font, new Size(Width - 52, 10000), TextFormatFlags.WordBreak | TextFormatFlags.NoPadding).Height + (heading ? 10 : 7);
         }
@@ -344,16 +450,25 @@ internal sealed class OverlayForm : Form
             DrawLoading(e.Graphics);
             return;
         }
+        renderedBlockBounds.Clear();
         int y = 22 - scrollOffset;
-        foreach (var b in visible)
+        for (int index = 0; index < visible.Count; index++)
         {
+            var b = visible[index];
             bool heading = b.Kind == BlockKind.Heading;
-            using var font = new Font(settings.FontFamily, heading ? settings.FontSize + 4 : settings.FontSize, heading ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel);
+            using var font = new Font(settings.FontFamily, heading ? settings.FontSize + 4 : settings.FontSize, heading || b.Bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel);
             string text = b.Kind == BlockKind.Bullet && !Regex.IsMatch(b.Text, @"^([•●▪◦*-]|\d+[.)])") ? "• " + b.Text : b.Text;
             var rect = new Rectangle(26, y, Width - 52, Height - y - 18);
             var flags = TextFormatFlags.WordBreak | TextFormatFlags.NoPadding;
             var size = TextRenderer.MeasureText(e.Graphics, text, font, new Size(rect.Width, 1000), flags);
-            TextRenderer.DrawText(e.Graphics, text, font, rect, Color.FromArgb(245, 248, 252), flags);
+            var blockRect = new Rectangle(rect.X, rect.Y, rect.Width, size.Height);
+            renderedBlockBounds[index] = blockRect;
+            if (selectedBlocks.Contains(index))
+            {
+                using var selection = new SolidBrush(Color.FromArgb(120, 48, 133, 230));
+                e.Graphics.FillRectangle(selection, blockRect);
+            }
+            TextRenderer.DrawText(e.Graphics, text, font, blockRect, Color.FromArgb(245, 248, 252), flags);
             y += size.Height + (heading ? 10 : 7); if (y > Height - 25) break;
         }
         int contentHeight = MeasureContentHeight(), viewport = Height - 48;
@@ -368,7 +483,7 @@ internal sealed class OverlayForm : Form
             e.Graphics.FillPath(thumb, thumbPath);
         }
         using var hint = new Font("Segoe UI", 10, FontStyle.Regular, GraphicsUnit.Pixel);
-        TextRenderer.DrawText(e.Graphics, "двойной щелчок / Esc — закрыть", hint, new Point(27, Height - 18), Color.FromArgb(145, 220, 228, 240), TextFormatFlags.NoPadding);
+        TextRenderer.DrawText(e.Graphics, "выделение мышью · Ctrl+C — копировать · колесо — прокрутка", hint, new Point(27, Height - 18), Color.FromArgb(165, 220, 228, 240), TextFormatFlags.NoPadding);
     }
     void DrawLoading(Graphics g)
     {
@@ -387,7 +502,7 @@ internal sealed class OverlayForm : Form
     }
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { typing.Dispose(); loadingAnimation.Dispose(); }
+        if (disposing) { typing.Dispose(); loadingAnimation.Dispose(); ContextMenuStrip?.Dispose(); }
         base.Dispose(disposing);
     }
     static GraphicsPath RoundedRect(Rectangle r, int radius) { int d = radius * 2; var p = new GraphicsPath(); p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90); p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90); p.CloseFigure(); return p; }
@@ -433,7 +548,7 @@ internal static class Native
         {
             DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, ref enabled, sizeof(int));
             DwmSetWindowAttribute(h, DWMWA_SYSTEMBACKDROP_TYPE, ref transientWindow, sizeof(int));
-            int alpha = Math.Clamp((int)(opacity * 105), 55, 110);
+            int alpha = Math.Clamp((int)(opacity * 34), 20, 40);
             var accent = new AccentPolicy { AccentState = 4, GradientColor = (alpha << 24) | (44 << 16) | (36 << 8) | 28 };
             int size = Marshal.SizeOf(accent);
             IntPtr ptr = Marshal.AllocHGlobal(size);

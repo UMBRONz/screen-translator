@@ -9,7 +9,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>ScreenTranslator</AssemblyName>
     <RootNamespace>ScreenTranslator</RootNamespace>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>UMBRONz</Authors>
     <Description>Windows tray application for OCR and instant Russian translation of screen regions.</Description>
     <RepositoryUrl>https://github.com/UMBRONz/screen-translator</RepositoryUrl>
